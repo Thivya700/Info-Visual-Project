@@ -1,0 +1,259 @@
+// Define the Region of Interest (ROI) using MultiPoint geometry
+var multiPoint = ee.Geometry.MultiPoint([
+  [101.67465583252506, 3.176746734475024],
+  [101.49506444037763, 3.5155126590863213]
+]);
+
+// Filter the feature collection using the MultiPoint geometry
+var roi = table.filterBounds(multiPoint)
+  .map(function(vec) {
+    return vec.simplify(1000);
+  });
+
+Map.centerObject(multiPoint);
+Map.addLayer(multiPoint, {color: 'red'}, 'MultiPoint Geometry');
+Map.addLayer(roi, {}, 'ROI');
+
+// Define the time periods for analysis (2019 to 2023)
+var timePeriods = [
+  {start: '2019-01-01', end: '2019-12-31'},
+  {start: '2020-01-01', end: '2020-12-31'},
+  {start: '2021-01-01', end: '2021-12-31'},
+  {start: '2022-01-01', end: '2022-12-31'},
+  {start: '2023-01-01', end: '2023-12-31'}
+];
+
+// Define the image collections
+var landsatCollection = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2");
+var dynamicWorldCollection = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1");
+
+// Initialize lists to store data for the time series chart
+var years = [];
+var meanUHIValues = [];
+var areaData = [];  // To store area statistics for each UHI intensity class
+var vegetationCoverData = []; // To store vegetation cover data
+
+// Function to calculate UHI for a given time period
+function calculateMetrics(timePeriod) {
+  // Filter urban areas
+  var urban = dynamicWorldCollection.select('label')
+    .filterDate(timePeriod.start, timePeriod.end)
+    .filterBounds(roi)
+    .filter(ee.Filter.calendarRange(5, 9, 'month'))
+    .mode().eq(6);
+
+  // Process Landsat Thermal Infrared (TIR) images
+  var landsat = landsatCollection.select('ST_B10')
+    .filterBounds(roi)
+    .filterDate(timePeriod.start, timePeriod.end)
+    .filter(ee.Filter.calendarRange(5, 9, 'month'))
+    .filter(ee.Filter.lt('CLOUD_COVER', 45))
+    .map(function(img) {
+      var gain = ee.Number(img.get('TEMPERATURE_MULT_BAND_ST_B10'));
+      var offset = ee.Number(img.get('TEMPERATURE_ADD_BAND_ST_B10'));
+      return img.multiply(gain).add(offset)
+        .copyProperties(img, img.propertyNames());
+    });
+
+  var tir_img = landsat.median();
+  // Define a color palette for TIR Median
+  var tirPalette = [
+    'blue', 'cyan', 'green', 'yellow', 'orange', 'red', 'brown'
+  ];
+  
+  // Compute TIR statistics
+  var tirStats = tir_img.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: roi,
+    scale: 100,
+    bestEffort: true
+  });
+
+  // Print the tirStats object
+  print('TIR Statistics for', timePeriod.start.split('-')[0], ':', tirStats);
+
+  // Extract min and max values
+  var minTIR = ee.Number(tirStats.get('ST_B10_min'));
+  var maxTIR = ee.Number(tirStats.get('ST_B10_max'));
+
+// Add the TIR Median layer with the color palette
+Map.addLayer(tir_img.clip(roi), {
+  min: minTIR.getInfo(), 
+  max: maxTIR.getInfo(),
+  palette: tirPalette
+}, 'TIR Median ' + timePeriod.start.split('-')[0], false);
+ 
+  // Calculate the mean TIR value
+  var tir_mean = ee.Number(tir_img.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: roi, scale: 100
+  }).values().get(0));
+
+  // Calculate UHI intensity
+  var uhi = tir_img.expression('(tir - mean) / mean', {
+    'tir': tir_img,
+    'mean': tir_mean
+  }).rename('uhi');
+  Map.addLayer(uhi.clip(roi), {}, 'UHI ' + timePeriod.start.split('-')[0], false);
+
+  // Classify UHI intensity levels
+  var uhi_class = ee.Image.constant(0).where(uhi.gte(0).and(uhi.lt(0.005)), 1) // weak
+    .where(uhi.gte(0.005).and(uhi.lt(0.010)), 2) // middle
+    .where(uhi.gte(0.010).and(uhi.lt(0.015)), 3) // strong
+    .where(uhi.gte(0.015).and(uhi.lt(0.020)), 4) // stronger
+    .where(uhi.gte(0.020), 5) // strongest
+    .updateMask(urban);
+  Map.addLayer(uhi_class.clip(roi), {min: 1, max: 5, palette: ['white', 'yellow', 'orange', 'red', 'brown']}, 'UHI Classification ' + timePeriod.start.split('-')[0], false);
+
+  // Calculate the area for each UHI intensity class
+  var areaImage = ee.Image.pixelArea().addBands(uhi_class);
+  var areas = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'class'
+    }),
+    geometry: roi,
+    scale: 100,
+    bestEffort: true
+  }).get('groups');
+
+  // Convert area statistics to a list
+  var areaStats = ee.List(areas).map(function(stat) {
+    stat = ee.Dictionary(stat);
+    return [stat.get('class'), ee.Number(stat.get('sum')).divide(1e6)]; // Convert to km²
+  });
+  
+  areaData.push(ee.List([parseInt(timePeriod.start.split('-')[0], 10), areaStats]));
+
+  // Collect data for the time series chart
+  years.push(parseInt(timePeriod.start.split('-')[0], 10));
+  meanUHIValues.push(tir_mean.getInfo());
+}
+
+// Function to calculate Vegetation Cover for a given time period using 'trees' band
+function calculateVegetationCover(timePeriod) {
+  // Filter vegetation cover data
+  var vegetation = dynamicWorldCollection.select('trees')
+    .filterDate(timePeriod.start, timePeriod.end)
+    .filterBounds(roi)
+    .filter(ee.Filter.calendarRange(5, 9, 'month'))
+    .mean(); // Compute the mean vegetation cover for the period
+  
+  // Define a detailed color palette for vegetation cover
+  var vegetationPalette = ['#f7f7f7', '#e1f5e4', '#a4de02', '#6b8e23', '#004d00']; // Customize as needed
+  
+  // Add Vegetation Cover layer to the map with a detailed palette
+  Map.addLayer(vegetation.clip(roi), {min: 0, max: 1, palette: vegetationPalette}, 'Vegetation Cover ' + timePeriod.start.split('-')[0], true);
+
+  // Calculate the mean vegetation cover value
+  var veg_cover_mean = ee.Number(vegetation.reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: roi, scale: 100
+  }).values().get(0));
+
+  // Store the vegetation cover data
+  vegetationCoverData.push(ee.List([parseInt(timePeriod.start.split('-')[0], 10), veg_cover_mean.getInfo()]));
+
+  // Print the statistics for verification
+  var vegStats = vegetation.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: roi,
+    scale: 100,
+    bestEffort: true
+  });
+  print('Vegetation Cover Statistics for', timePeriod.start.split('-')[0], ':', vegStats);
+}
+
+// Iterate over each time period and calculate metrics and vegetation cover
+timePeriods.forEach(function(timePeriod) {
+  calculateMetrics(timePeriod);
+  calculateVegetationCover(timePeriod);
+});
+
+// Create a time series line chart for mean UHI values
+var timeSeriesChart = ui.Chart.array.values({
+  array: ee.Array(meanUHIValues),
+  axis: 0,
+  xLabels: years.map(String)
+})
+.setChartType('LineChart')
+.setOptions({
+  title: 'Mean UHI Intensity Over Time',
+  hAxis: {title: 'Year'},
+  vAxis: {title: 'Mean UHI Intensity'},
+  lineWidth: 2,
+  pointSize: 4,
+  series: {0: {color: 'red'}}
+});
+
+// Display the time series chart
+print(timeSeriesChart);
+
+// Create a distributed bar graph for UHI classes vs. area covered
+var uhiAreaFeatures = ee.FeatureCollection(areaData.map(function(yearData) {
+  var year = ee.List(yearData).get(0);
+  var data = ee.List(yearData).get(1);
+
+  return ee.Feature(null, ee.Dictionary.fromLists(
+    ee.List(data).map(function(item) { return ee.String(ee.Number(ee.List(item).get(0)).format()); }),
+    ee.List(data).map(function(item) { return ee.List(item).get(1); })
+  ).set('year', year));
+}));
+
+var areaChart = ui.Chart.feature.byFeature(uhiAreaFeatures, 'year')
+  .setChartType('ColumnChart')
+  .setOptions({
+    title: 'UHI Classes Area Distribution Over Time',
+    hAxis: {title: 'Year'},
+    vAxis: {title: 'Area (km²)'},
+    isStacked: true,
+    seriesType: 'bars',
+    series: {
+      1: {color: 'white'},
+      2: {color: 'yellow'},
+      3: {color: 'orange'},
+      4: {color: 'red'},
+      5: {color: 'brown'}
+    }
+  });
+
+print(areaChart);
+
+// Create a time series line chart for mean vegetation cover
+var vegetationCoverChart = ui.Chart.array.values({
+  array: ee.Array(vegetationCoverData.map(function(d) { return ee.List(d).get(1); })),
+  axis: 0,
+  xLabels: years.map(String)
+})
+.setChartType('LineChart')
+.setOptions({
+  title: 'Mean Vegetation Cover Over Time',
+  hAxis: {title: 'Year'},
+  vAxis: {title: 'Mean Vegetation Cover'},
+  lineWidth: 2,
+  pointSize: 4,
+  series: {0: {color: 'green'}}
+});
+
+print(vegetationCoverChart);
+
+// Prepare data for regression analysis
+var regressionData = ee.FeatureCollection(vegetationCoverData.map(function(d, i) {
+  return ee.Feature(null, {
+    year: ee.List(d).get(0),
+    vegetation: ee.List(d).get(1),
+    uhi: meanUHIValues[i]
+  });
+}));
+
+// Create a scatter plot with regression line for vegetation cover vs. UHI intensity
+var scatterPlot = ui.Chart.feature.byFeature(regressionData, 'vegetation', 'uhi')
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'Vegetation Cover vs. UHI Intensity',
+    hAxis: {title: 'Mean Vegetation Cover'},
+    vAxis: {title: 'Mean UHI Intensity'},
+    trendlines: {0: {showR2: true, visibleInLegend: true}},
+    pointSize: 4,
+    series: {0: {color: 'blue'}}
+  });
+
+print(scatterPlot);
